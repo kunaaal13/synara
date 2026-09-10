@@ -25,6 +25,60 @@ describe("deriveWorkLogEntries", () => {
     expect(entries.map((entry) => entry.id)).toEqual(["tool-start"]);
   });
 
+  it("strips terminal formatting from persisted provider activity details", () => {
+    const [entry] = deriveWorkLogEntries(
+      [
+        makeActivity({
+          id: "pi-plugin-status",
+          kind: "tool.updated",
+          summary: "Pi plugin",
+          payload: {
+            itemType: "mcp_tool_call",
+            title: "MCP tool call",
+            detail: "\u001b[38;2;215;119;87mTransmuting...\u001b[0m",
+          },
+        }),
+      ],
+      undefined,
+    );
+
+    expect(entry?.detail).toBe("Transmuting...");
+  });
+
+  it("preserves bracketed source text in provider activity details", () => {
+    const detail = "const first = items[0]; // [example]";
+    const [entry] = deriveWorkLogEntries(
+      [
+        makeActivity({
+          id: "source-output",
+          kind: "tool.updated",
+          summary: "Read file",
+          payload: { detail },
+        }),
+      ],
+      undefined,
+    );
+
+    expect(entry?.detail).toBe(detail);
+  });
+
+  it("cleans persisted notice messages without losing bracketed content", () => {
+    const [entry] = deriveWorkLogEntries(
+      [
+        makeActivity({
+          id: "pi-notice",
+          kind: "runtime.warning",
+          summary: "Pi extension",
+          payload: { message: "\u001b[31mEnabled [full] mode\u001b[0m" },
+        }),
+      ],
+      undefined,
+    );
+
+    expect(entry?.detail).toBe("Enabled [full] mode");
+    expect(entry?.label).toBe("Pi extension");
+  });
+
   it("does not expose unmapped diagnostic data as a transcript preview", () => {
     const [entry] = deriveWorkLogEntries(
       [
@@ -366,7 +420,7 @@ describe("deriveWorkLogEntries", () => {
         id: "context-restart",
         turnId: "turn-hidden",
         kind: "provider.context.changed",
-        summary: "Native session history was unavailable.",
+        summary: "The session's history was lost, so the model continues from a summary.",
         tone: "error",
         payload: {
           provider: "opencode",
@@ -415,7 +469,7 @@ describe("deriveWorkLogEntries", () => {
           id: "context-restart-without-recap",
           turnId: "turn-2",
           kind: "provider.context.changed",
-          summary: "The session restarted without its native history.",
+          summary: "The session restarted without its previous history.",
           tone: "error",
           payload: {
             provider: "codex",
@@ -440,6 +494,43 @@ describe("deriveWorkLogEntries", () => {
       recapInjected: false,
       recapCharacters: 0,
       recapPreview: null,
+      recapPreviewTruncated: false,
+    });
+  });
+
+  it("keeps interrupt-escalation context-loss markers visible", () => {
+    const [entry] = deriveWorkLogEntries(
+      [
+        makeActivity({
+          id: "interrupt-escalation-context",
+          turnId: "turn-3",
+          kind: "provider.context.changed",
+          summary:
+            "The turn could not be stopped cleanly, so the session was restarted and your message included a summary.",
+          tone: "error",
+          payload: {
+            provider: "opencode",
+            nativeHistory: "unavailable",
+            sessionRestarted: true,
+            restartReason: "interrupt-escalation",
+            recapInjected: true,
+            recapCharacters: 900,
+            recapPreview: "Earlier conversation summary",
+            recapPreviewTruncated: false,
+          },
+        }),
+      ],
+      TurnId.makeUnsafe("turn-3"),
+    );
+
+    expect(entry?.providerContextLifecycle).toEqual({
+      provider: "opencode",
+      nativeHistory: "unavailable",
+      sessionRestarted: true,
+      restartReason: "interrupt-escalation",
+      recapInjected: true,
+      recapCharacters: 900,
+      recapPreview: "Earlier conversation summary",
       recapPreviewTruncated: false,
     });
   });

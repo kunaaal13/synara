@@ -289,6 +289,7 @@ import {
 } from "../pendingUserInput";
 import { selectRightDockState, useRightDockStore } from "../rightDockStore";
 import { waitForSidechatCreator } from "../lib/sidechatCreatorRegistry";
+import { useProjectEnvironmentStore } from "../projectEnvironmentStore";
 import { useStore } from "../store";
 import { RenameThreadDialog } from "./RenameThreadDialog";
 import { getThreadFromState } from "../threadDerivation";
@@ -3652,6 +3653,11 @@ export default function ChatView({
     hasTimelineEntries: timelineEntries.length > 0,
     detailSyncState: threadDetailSyncState,
   });
+  // Turn/session updates can arrive before the first transcript row. An empty
+  // synced snapshot during startup must not restore the unstarted landing.
+  // Terminal turns can lack start timestamps after restore/import; their state wins.
+  const hasPendingThreadWork =
+    isWorking || (activeLatestTurnState === "running" && !latestTurnSettled);
   const handleRetryThreadDetailSync = useCallback(() => {
     useStore.getState().clearThreadDetailSyncFailure(threadId);
     const api = readNativeApi();
@@ -3673,13 +3679,14 @@ export default function ChatView({
         />
       );
     }
-    return undefined;
-  }, [handleRetryThreadDetailSync, isEditorRail, threadDetailHydration]);
+    return hasPendingThreadWork ? <span aria-hidden="true" /> : undefined;
+  }, [handleRetryThreadDetailSync, hasPendingThreadWork, isEditorRail, threadDetailHydration]);
   // Empty top-level threads render the centered landing composer instead of the transcript pane.
   // Home-scoped chats get the global "What should we work on?" copy plus the project picker,
   // while project-scoped drafts reuse the same centered layout with folder-specific copy.
   const isCenteredEmptyLanding =
     timelineEntries.length === 0 &&
+    !hasPendingThreadWork &&
     !activeThread?.parentThreadId &&
     !isEditorRail &&
     threadDetailHydration === "ready";
@@ -10211,6 +10218,9 @@ export default function ChatView({
   ]);
   const onEnvModeChange = useCallback(
     (mode: DraftThreadEnvMode) => {
+      if (activeProject) {
+        useProjectEnvironmentStore.getState().setProjectEnvMode(activeProject.id, mode);
+      }
       const nextBranch =
         mode === "worktree"
           ? (activeThread?.branch ?? draftThread?.branch ?? activeRootBranch ?? null)
@@ -10238,6 +10248,7 @@ export default function ChatView({
       scheduleComposerFocus();
     },
     [
+      activeProject,
       activeThread,
       activeRootBranch,
       draftThread?.branch,

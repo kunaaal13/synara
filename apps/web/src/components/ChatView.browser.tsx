@@ -39,6 +39,7 @@ import {
   getScrollContainerDistanceFromBottom,
 } from "../chat-scroll";
 import { useLatestProjectStore } from "../latestProjectStore";
+import { useProjectEnvironmentStore } from "../projectEnvironmentStore";
 import {
   INLINE_TERMINAL_CONTEXT_PLACEHOLDER,
   type TerminalContextDraft,
@@ -2126,6 +2127,7 @@ describe("ChatView transcript geometry (full app)", () => {
     attachmentUploadBarrier = null;
     attachmentCancelBarrier = null;
     localStorage.clear();
+    useProjectEnvironmentStore.setState({ envModeByProjectId: {} });
     useLatestProjectStore.setState({ latestProjectId: null });
     useWorkspacePathsStore.setState({
       homeDir: null,
@@ -7233,7 +7235,7 @@ describe("ChatView transcript geometry (full app)", () => {
     }
   });
 
-  it("offers New worktree from an empty draft thread", async () => {
+  it("remembers Local and New worktree choices for subsequent project chats", async () => {
     const mounted = await mountChatView({
       viewport: DEFAULT_VIEWPORT,
       snapshot: createSnapshotForTargetUser({
@@ -7279,10 +7281,206 @@ describe("ChatView transcript geometry (full app)", () => {
         },
         { timeout: 8_000, interval: 16 },
       );
+      expect(useProjectEnvironmentStore.getState().envModeByProjectId[PROJECT_ID]).toBe("worktree");
+
+      let previousDraftId = newThreadId;
+      for (const expectedMode of ["worktree", "local"] as const) {
+        await mounted.router.navigate({ to: "/$threadId", params: { threadId: THREAD_ID } });
+        useComposerDraftStore.getState().clearDraftThread(previousDraftId);
+        await newThreadButton.click();
+        const nextPath = await waitForURL(
+          mounted.router,
+          (path) => UUID_ROUTE_RE.test(path) && path !== `/${previousDraftId}`,
+          "The next chat should open a fresh draft.",
+        );
+        previousDraftId = nextPath.slice(1) as ThreadId;
+        await vi.waitFor(() => {
+          expect(useComposerDraftStore.getState().getDraftThread(previousDraftId)).toMatchObject({
+            projectId: PROJECT_ID,
+            envMode: expectedMode,
+            worktreePath: null,
+          });
+        });
+
+        if (expectedMode === "worktree") {
+          const picker = await waitForEnvironmentModeButton("Worktree");
+          picker.click();
+          await page.getByRole("menuitem", { name: "Local project", exact: true }).click();
+          await vi.waitFor(() => {
+            expect(useProjectEnvironmentStore.getState().envModeByProjectId[PROJECT_ID]).toBe(
+              "local",
+            );
+          });
+        }
+      }
     } finally {
       await mounted.cleanup();
     }
   });
+
+  it("keeps the first sent message visible throughout draft promotion", async () => {
+    const restoreNativeApi = installDeterministicSendNativeApi();
+    useComposerDraftStore.getState().setProjectDraftThreadId(PROJECT_ID, THREAD_ID);
+    const mounted = await mountChatView({
+      viewport: DEFAULT_VIEWPORT,
+      snapshot: createDraftOnlySnapshot(),
+    });
+
+    try {
+      const prompt = "Keep the first message on screen";
+      useComposerDraftStore.getState().setPrompt(THREAD_ID, prompt);
+      const sendButton = await waitForSendButton();
+      expect(sendButton.disabled).toBe(false);
+      sendButton.click();
+      const startCommand = await vi.waitFor(() => {
+        const command = wsRequests
+          .map(readDispatchedCommand)
+          .find((candidate) => candidate?.type === "thread.turn.start");
+        expect(command).toBeDefined();
+        return command!;
+      });
+      const message = startCommand.message as { messageId: MessageId; text: string };
+      const messageSelector = `[data-message-id="${message.messageId}"][data-message-role="user"]`;
+      const expectTranscript = async () => {
+        await waitForLayout();
+        expect(document.querySelectorAll(messageSelector)).toHaveLength(1);
+        expect(document.querySelector(messageSelector)?.textContent).toContain(prompt);
+        expect(document.querySelector('[data-empty-landing-composer-block="true"]')).toBeNull();
+        expect(mounted.router.state.location.pathname).toBe(`/${THREAD_ID}`);
+      };
+      await expectTranscript();
+
+      const createdSnapshot = addThreadToSnapshot(fixture.snapshot, THREAD_ID);
+      const createdThread = { ...createdSnapshot.threads[0]!, session: null };
+      fixture.snapshot = { ...createdSnapshot, threads: [createdThread] };
+      useStore
+        .getState()
+        .syncServerShellSnapshot(createShellSnapshotFromReadModel(fixture.snapshot));
+      await expectTranscript();
+      useStore.getState().syncServerThreadDetailHotPath(createdThread);
+      await expectTranscript();
+
+      const startedThread = {
+        ...createdThread,
+        messages: [
+          {
+            ...createUserMessage({ id: message.messageId, text: message.text, offsetSeconds: 1 }),
+            createdAt: startCommand.createdAt as string,
+            updatedAt: startCommand.createdAt as string,
+          },
+        ],
+      };
+      fixture.snapshot = {
+        ...fixture.snapshot,
+        snapshotSequence: fixture.snapshot.snapshotSequence + 1,
+        threads: [startedThread],
+      };
+      useStore.getState().syncServerThreadDetailHotPath(startedThread);
+      useComposerDraftStore.getState().finalizePromotedDraftThread(THREAD_ID);
+      await expectTranscript();
+
+      // A creation snapshot can finish after the first message echo.
+      useStore.getState().syncServerThreadDetailHotPath(createdThread);
+      await expectTranscript();
+    } finally {
+      await mounted.cleanup();
+      restoreNativeApi();
+    }
+  });
+
+  it("keeps the transcript open while the first turn starts before its message arrives", async () => {
+    const snapshot = addThreadToSnapshot(createDraftOnlySnapshot(), THREAD_ID);
+    const emptyThread = { ...snapshot.threads[0]!, session: null };
+    const mounted = await mountChatView({
+      viewport: DEFAULT_VIEWPORT,
+      snapshot: { ...snapshot, threads: [emptyThread] },
+    });
+
+    try {
+      await expect.element(page.getByTestId("empty-landing-heading")).toBeInTheDocument();
+      const pendingTurn = {
+        turnId: TurnId.makeUnsafe("first-turn-starting"),
+        state: "running" as const,
+        requestedAt: new Date().toISOString(),
+        startedAt: null,
+        completedAt: null,
+        assistantMessageId: null,
+      };
+      const pendingThread = { ...emptyThread, latestTurn: pendingTurn };
+      fixture.snapshot = { ...fixture.snapshot, threads: [pendingThread] };
+      useStore.getState().syncServerThreadDetailHotPath(pendingThread);
+      await waitForLayout();
+      expect(document.querySelector('[data-testid="empty-landing-heading"]')).toBeNull();
+      const transcriptPane = document.querySelector('[data-chat-transcript-pane="true"]');
+      expect(transcriptPane).not.toBeNull();
+      expect(transcriptPane?.textContent).not.toContain("What should");
+      expect(transcriptPane?.textContent).not.toContain(
+        "Send a message to start the conversation.",
+      );
+
+      for (const status of ["starting", "running"] as const) {
+        const thread = {
+          ...pendingThread,
+          session: { ...snapshot.threads[0]!.session!, status },
+        };
+        fixture.snapshot = { ...fixture.snapshot, threads: [thread] };
+        useStore.getState().syncServerThreadDetailHotPath(thread);
+        await waitForLayout();
+        expect(document.querySelector('[data-testid="empty-landing-heading"]')).toBeNull();
+        expect(document.querySelector('[data-chat-transcript-pane="true"]')).toBe(transcriptPane);
+      }
+
+      const startedThread = {
+        ...pendingThread,
+        messages: [
+          createUserMessage({
+            id: MessageId.makeUnsafe("first-turn-message"),
+            text: "Start the first turn",
+            offsetSeconds: 1,
+          }),
+        ],
+      };
+      fixture.snapshot = { ...fixture.snapshot, threads: [startedThread] };
+      useStore.getState().syncServerThreadDetailHotPath(startedThread);
+      await expect
+        .element(page.getByText("Start the first turn", { exact: true }))
+        .toBeInTheDocument();
+      expect(document.querySelector('[data-testid="empty-landing-heading"]')).toBeNull();
+      expect(document.querySelector('[data-chat-transcript-pane="true"]')).toBe(transcriptPane);
+    } finally {
+      await mounted.cleanup();
+    }
+  });
+
+  it.each(["completed", "interrupted", "error"] as const)(
+    "shows the empty landing for terminal state %s without a start timestamp",
+    async (state) => {
+      const snapshot = addThreadToSnapshot(createDraftOnlySnapshot(), THREAD_ID);
+      const emptyThread = {
+        ...snapshot.threads[0]!,
+        session: null,
+        latestTurn: {
+          turnId: TurnId.makeUnsafe("restored-terminal-turn"),
+          state,
+          requestedAt: isoAt(0),
+          startedAt: null,
+          completedAt: isoAt(1),
+          assistantMessageId: null,
+        },
+      };
+      const mounted = await mountChatView({
+        viewport: DEFAULT_VIEWPORT,
+        snapshot: { ...snapshot, threads: [emptyThread] },
+      });
+
+      try {
+        expect(document.querySelector('[data-testid="empty-landing-heading"]')).not.toBeNull();
+        expect(document.querySelector('[data-empty-landing-composer-block="true"]')).not.toBeNull();
+      } finally {
+        await mounted.cleanup();
+      }
+    },
+  );
 
   it("creates a detached worktree on first send in New worktree mode", async () => {
     const restoreNativeApi = installDeterministicSendNativeApi();
@@ -8155,16 +8353,20 @@ describe("ChatView transcript geometry (full app)", () => {
     });
 
     try {
+      useProjectEnvironmentStore.getState().setProjectEnvMode(PROJECT_ID, "worktree");
       await waitForNewThreadShortcutLabel();
       await waitForServerConfigToApply();
       const composerEditor = await waitForComposerEditor();
       composerEditor.focus();
       await waitForLayout();
-      await triggerChatNewShortcutUntilPath(
+      const nextPath = await triggerChatNewShortcutUntilPath(
         mounted.router,
         (path) => UUID_ROUTE_RE.test(path),
         "Route should have changed to a new draft thread UUID from the shortcut.",
       );
+      expect(
+        useComposerDraftStore.getState().getDraftThread(nextPath.slice(1) as ThreadId),
+      ).toMatchObject({ envMode: "worktree", worktreePath: null });
     } finally {
       await mounted.cleanup();
     }

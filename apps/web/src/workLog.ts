@@ -21,7 +21,7 @@ import {
   stripTrailingToolExitCode,
   summarizeToolRawOutput,
 } from "@synara/shared/toolOutputSummary";
-import { pluralize } from "@synara/shared/text";
+import { pluralize, stripTerminalControlSequences } from "@synara/shared/text";
 import { PROVIDER_DESCRIPTORS } from "@synara/shared/providerMetadata";
 import {
   deriveReadableToolTitle,
@@ -53,6 +53,7 @@ const SESSION_CONTEXT_RECAP_PREVIEW_MAX_CHARS = 600;
 export type ProviderContextLifecycleReason =
   | "conversation-rebuilt"
   | "fresh-session"
+  | "interrupt-escalation"
   | "native-history-unavailable"
   | "native-resume-failed";
 
@@ -522,6 +523,7 @@ function isProviderContextLifecycleReason(value: unknown): value is ProviderCont
   return (
     value === "conversation-rebuilt" ||
     value === "fresh-session" ||
+    value === "interrupt-escalation" ||
     value === "native-history-unavailable" ||
     value === "native-resume-failed"
   );
@@ -600,7 +602,7 @@ function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWo
   const itemType = extractWorkLogItemType(payload);
   const requestKind = extractWorkLogRequestKind(payload);
   if (payload && typeof payload.detail === "string" && payload.detail.length > 0) {
-    const detail = stripTrailingExitCode(payload.detail).output;
+    const detail = stripTrailingExitCode(stripTerminalControlSequences(payload.detail)).output;
     if (detail) {
       entry.detail = detail;
     }
@@ -608,11 +610,11 @@ function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWo
   const outputDetail =
     activity.kind === "provider.event.unmapped" ? null : summarizeToolPayloadOutput(payload);
   if (outputDetail && (!entry.detail || toolStatus === "failed")) {
-    entry.detail = outputDetail;
+    entry.detail = stripTerminalControlSequences(outputDetail);
   }
   const collabTaskOutputDetail = extractCollabTaskOutputDetail(payload);
   if (collabTaskOutputDetail) {
-    entry.detail = collabTaskOutputDetail;
+    entry.detail = stripTerminalControlSequences(collabTaskOutputDetail);
   }
   const nativeEventType =
     payload && typeof payload.nativeEventType === "string" && payload.nativeEventType.length > 0
@@ -625,7 +627,7 @@ function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWo
     activity.kind === "runtime.warning" &&
     typeof payload?.message === "string" &&
     payload.message.trim().length > 0
-      ? payload.message.trim()
+      ? stripTerminalControlSequences(payload.message).trim()
       : undefined;
   if (runtimeWarningMessage) {
     entry.detail = runtimeWarningMessage;
